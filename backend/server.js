@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const multer = require('multer');
-const fs = require('fs');
+const fs = require('fs').promises;
 const path = require('path');
 const OpenAI = require("openai");
 const sanitizeHtml = require('sanitize-html');
@@ -29,20 +29,20 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 app.post('/api/upload', upload.single('file'), async (req, res) => {
-  console.log('Richiesta di upload ricevuta');
-  if (!req.file) {
-    console.log('Nessun file nella richiesta');
-    return res.status(400).json({ error: 'Nessun file caricato' });
-  }
-  console.log('File caricato:', req.file.filename);
-  
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
   try {
-    // Inizia l'elaborazione del file
     const result = await processFile(req.file, res);
-    res.json({ success: true, message: 'File elaborato con successo', result });
+    res.write(`data: ${JSON.stringify(result)}\n\n`);
   } catch (error) {
     console.error('Errore durante l\'elaborazione del file:', error);
-    res.status(500).json({ error: 'Errore durante l\'elaborazione del file', details: error.message });
+    res.write(`data: error: ${error.message}\n\n`);
+  } finally {
+    res.end();
   }
 });
 
@@ -54,13 +54,17 @@ const openai = new OpenAI({
   defaultHeaders: {
     "HTTP-Referer": process.env.YOUR_SITE_URL || "http://localhost:3000",
     "X-Title": process.env.YOUR_SITE_NAME || "Sin-Text",
-  }
+  },
+  timeout: 600000 // 10 minuti
 });
 
 console.log('Client OpenAI inizializzato');
 
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:8080',
+  credentials: true
+}));
 console.log('Middleware JSON configurato');
 
 // Definisci i tre prompt come costanti
@@ -173,12 +177,51 @@ Usare un formato chiaro e dettagliato
 `;
 
 async function elaboraDocumentoCompleto(pdfText, res) {
+  console.log('Inizio elaborazione del documento');
   sendMessage(res, 'Inizio elaborazione del documento');
-  const risultatoParte1 = await elaboraParteConOpenRouter(PROMPT_PARTE_1, pdfText, res, 1);
-  const risultatoParte2 = await elaboraParteConOpenRouter(PROMPT_PARTE_2, pdfText, res, 2);
-  const risultatoParte3 = await elaboraParteConOpenRouter(PROMPT_PARTE_3, pdfText, res, 3);
+  sendMessage(res, 'progress:10');
 
-  const htmlContent = `
+  try {
+    const promptCompleto = `
+${PROMPT_PARTE_1}
+
+${PROMPT_PARTE_2}
+
+${PROMPT_PARTE_3}
+
+Contenuto del PDF:
+${pdfText}
+`;
+
+    console.log('Lunghezza del prompt completo:', promptCompleto.length);
+    sendMessage(res, 'Invio del prompt completo a Claude');
+    sendMessage(res, 'progress:30');
+
+    console.log('Inizio chiamata a OpenAI');
+    const completion = await timeoutPromise(
+      openai.chat.completions.create({
+        model: "anthropic/claude-3-sonnet-20240229",
+        messages: [
+          { role: "system", content: "Sei un assistente esperto nell'analisi di documenti." },
+          { role: "user", content: promptCompleto }
+        ],
+        timeout: 600000 // 10 minuti
+      }),
+      600000 // 10 minuti
+    );
+    console.log('Chiamata a OpenAI completata');
+
+    if (!completion.choices || completion.choices.length === 0) {
+      throw new Error("Risposta non valida da OpenAI");
+    }
+
+    const testo = completion.choices[0].message.content;
+    console.log('Lunghezza della risposta ricevuta:', testo.length);
+
+    sendMessage(res, 'Analisi completata con successo usando Claude 3.5 Sonnet');
+    sendMessage(res, 'progress:90');
+
+    const htmlContent = `
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -197,36 +240,66 @@ async function elaboraDocumentoCompleto(pdfText, res) {
 </head>
 <body>
     <h1>Sintesi del Capitolato di Gara</h1>
-    ${risultatoParte1.testo}
-    ${risultatoParte2.testo}
-    ${risultatoParte3.testo}
+    ${testo}
 </body>
 </html>
-  `;
+    `;
 
-  return { htmlContent, modelUsed: risultatoParte3.modelUsed };
+    console.log('Elaborazione del documento completata');
+    return { htmlContent, modelUsed: "Claude 3.5 Sonnet" };
+  } catch (error) {
+    console.error('Errore durante l\'elaborazione del documento:', error);
+    sendMessage(res, `Errore durante l'elaborazione: ${error.message}`);
+    throw error;
+  }
+}
+
+// Funzione per gestire il timeout manualmente
+function timeoutPromise(promise, timeout) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Timeout superato')), timeout)
+    )
+  ]);
 }
 
 async function processFile(file, res) {
   console.log('Inizio elaborazione del file:', file.filename);
   
-  // Estrai il testo dal PDF
-  const pdfText = await extractTextFromPDF(file.path);
-  
-  // Invia aggiornamenti al client
-  sendMessage(res, 'Estrazione del testo completata');
-  
-  // Elabora il documento con OpenRouter
-  const result = await elaboraDocumentoCompleto(pdfText, res);
-  
-  // Genera il documento DOCX
-  const docxPath = await generateDOCX(result.htmlContent);
-  
-  return { fileName: path.basename(docxPath), modelUsed: result.modelUsed };
+  try {
+    console.log('Inizio estrazione del testo dal PDF');
+    const pdfText = await extractTextFromPDF(file.path);
+    console.log('Estrazione del testo completata. Lunghezza del testo:', pdfText.length);
+    sendMessage(res, 'Estrazione del testo completata');
+    
+    console.log('Inizio elaborazione del documento completo');
+    const result = await elaboraDocumentoCompleto(pdfText, res);
+    console.log('Elaborazione del documento completata');
+    
+    console.log('Inizio generazione del file DOCX');
+    const docxPath = await generateDOCX(result.htmlContent);
+    console.log('Generazione del file DOCX completata:', docxPath);
+    
+    sendMessage(res, 'Analisi completata e pronta per il download');
+    
+    return { fileName: path.basename(docxPath), modelUsed: result.modelUsed };
+  } catch (error) {
+    console.error('Errore durante l\'elaborazione del file:', error);
+    sendMessage(res, `Errore durante l'elaborazione: ${error.message}`);
+    throw error;
+  }
 }
 
 function sendMessage(res, message) {
-  res.write(`data: ${JSON.stringify({ message })}\n\n`);
+  if (res.write) {
+    res.write(`data: ${message}\n\n`);
+    if (res.flush && typeof res.flush === 'function') {
+      res.flush();
+    }
+  } else {
+    console.warn('Impossibile inviare il messaggio al client:', message);
+  }
 }
 
 const frontendPath = path.join(__dirname, '..', 'frontend', 'dist');
@@ -245,7 +318,7 @@ app.get('/api/download/:fileName', async (req, res) => {
     const fileName = req.params.fileName;
     const filePath = path.join(__dirname, '..', 'uploads', 'docx', fileName);
     
-    const stats = await fs.promises.stat(filePath);
+    const stats = await fs.stat(filePath);
     console.log(`Dimensione del file sul server: ${stats.size} bytes`);
     
     res.setHeader('Content-Length', stats.size);
@@ -290,42 +363,28 @@ app.get('/api/download/:fileName', async (req, res) => {
   }
 });
 
-async function elaboraParteConOpenRouter(prompt, pdfText, res, partNumber) {
+async function extractTextFromPDF(filePath) {
   try {
-    sendMessage(res, `Modello scelto per la Parte ${partNumber}: Claude 3.5 Sonnet`);
-    sendMessage(res, `progress:${(partNumber - 1) * 30}`);
-    
-    sendMessage(res, `Invio del Prompt ${partNumber} a Claude`);
-    sendMessage(res, `progress:${(partNumber - 1) * 30 + 10}`);
-    
-    console.log('Prompt inviato:', prompt);
-    const completion = await openai.chat.completions.create({
-      model: "anthropic/claude-3-sonnet-20240229",
-      messages: [
-        { role: "system", content: "Sei un assistente esperto nell'analisi di documenti." },
-        { role: "user", content: prompt + "\n\nContenuto del PDF:\n" + pdfText }
-      ],
-    });
-    
-    console.log('Risposta ricevuta:', completion);
-    
-    if (!completion.choices || completion.choices.length === 0) {
-      throw new Error("Risposta non valida da OpenAI");
-    }
-    
-    sendMessage(res, `Analisi della Parte ${partNumber} completata con successo usando Claude 3.5 Sonnet`);
-    sendMessage(res, `progress:${partNumber * 30}`);
-    
-    return { testo: completion.choices[0].message.content, modelUsed: "Claude 3.5 Sonnet" };
+    const dataBuffer = await fs.readFile(filePath);
+    const data = await pdfParse(dataBuffer);
+    return data.text;
   } catch (error) {
-    console.error('Errore durante l\'analisi:', error);
-    console.error('Dettagli errore:', JSON.stringify(error, null, 2));
-    sendMessage(res, `Errore durante l'analisi della Parte ${partNumber}: ${error.message}`);
+    console.error('Errore durante l\'estrazione del testo dal PDF:', error);
     throw error;
   }
 }
 
-app.post('/api/process-file', upload.single('file'), async (req, res) => {
-  // Logica per processare il file
-  // ...
-});
+async function generateDOCX(htmlContent) {
+  const fileBuffer = await HTMLtoDOCX(htmlContent, null, {
+    table: { row: { cantSplit: true } },
+    footer: true,
+    pageNumber: true,
+  });
+
+  const docxFileName = `sintesi_${Date.now()}.docx`;
+  const docxPath = path.join(__dirname, '..', 'uploads', 'docx', docxFileName);
+  
+  await fs.writeFile(docxPath, fileBuffer);
+  
+  return docxPath;
+}
